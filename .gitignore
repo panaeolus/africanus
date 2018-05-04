@@ -1,0 +1,16 @@
+*~
+.\#*
+\#*\#
+*.jar
+*.class
+/.lein-*
+/lib/
+/classes/
+/out/
+/target/
+.repl
+.nrepl-port
+.sass-cache
+/resources
+.DS_STORE
+/native
