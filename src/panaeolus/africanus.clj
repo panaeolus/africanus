@@ -16,6 +16,11 @@
         (+ beat last-tick (- mod-div current-beat))
         (+ last-tick delta))))
 
+(defn a-seq? [v]
+  (or (vector? v)
+      (list? v)
+      (instance? clojure.lang.LazySeq v)))
+
 (defn calc-mod-div
   [durations]
   (let [meter 0
@@ -62,18 +67,31 @@
                                (if (empty? at)
                                  last-tick (last at)))))))))))
 
+
 (defn --resolve-arg-indicies [args a-index]
   (reduce (fn [init val]
             (if (fn? val)
               (conj init (val a-index))
-              (if-not (or (vector? val)
-                          (list? val))
+              (if-not (a-seq? val)
                 (conj init val)
                 (do
                   ;; (prn (nth val (mod a-index (count val))) val a-index)
                   (conj init (nth val (mod a-index (count val))))))))
           []
           args))
+
+(defn expand-nested-vectors-to-multiarg [args]
+  (let [longest-vec (->> args
+                         (filter a-seq?)
+                         (map count)
+                         (apply max))]
+    (for [n (range longest-vec)]
+      (reduce (fn [i v]
+                (if (a-seq? v)
+                  (if (<= (count v) n)
+                    (conj i (last v))
+                    (conj i (nth v n)))
+                  (conj i v))) [] args))))
 
 (defn event-loop [get-event-queue]
   (let [[event-queue-fn inst args] (get-event-queue)]
@@ -85,9 +103,20 @@
         (let [wait-chn (chan)]
           ;; (prn "next-timestamp" next-timestamp queue)
           (link/at next-timestamp
-                   (fn []
-                     (apply inst (--resolve-arg-indicies args index))
-                     (put! wait-chn true)))
+                   (let [args-processed (--resolve-arg-indicies args index)]
+                     (if (some a-seq? args-processed)
+                       (let [multiargs-processed
+                             (expand-nested-vectors-to-multiarg args-processed)]
+                         (fn []
+                           (if (node? inst)
+                             nil
+                             (run! #(apply inst %) multiargs-processed))
+                           (put! wait-chn true)))
+                       (fn []
+                         (if (node? inst)
+                           (apply ctl inst args-processed)
+                           (apply inst args-processed))
+                         (put! wait-chn true)))))
           (<! wait-chn)
           (recur (rest queue)
                  inst
@@ -124,7 +153,17 @@
 (def pattern-registry (atom {}))
 
 (defn pkill [k-name]
-  (swap! pattern-registry dissoc k-name))
+  (if (= :all k-name)
+    (do (when-let [keyz (keys @pattern-registry)]
+          (run! #(let [v (get @pattern-registry %)]
+                   (when (a-seq? v)
+                     (run! node-free (filter node? v))))
+                keyz))
+        (reset! pattern-registry {}))
+    (do (let [v (get @pattern-registry k-name)]
+          (when (a-seq? v)
+            (run! node-free (filter node? v))))
+        (swap! pattern-registry dissoc k-name))))
 
 ;; Useful util functions
 (defn samples-to-buffer [dir]
@@ -158,34 +197,36 @@
 
 (defn --longest-vector [args]
   (let [seqs (->> (rest (rest args))
-                  (filter #(or (vector? %) (list? %))))]
+                  (filter a-seq?))]
     (if (empty? seqs)
       1
       (->> seqs
            (map count)
            (apply max)))))
 
-(defn --loop [k-name inst args]
+(defn --loop [k-name envelope-type inst args]
   (let [pat-exists (contains? @pattern-registry k-name)
         beats (second args)
         beats (if (number? beats)
                 [beats]
-                (if (or (vector? beats)
-                        (list? beats))
+                (if (a-seq? beats)
                   beats
                   (throw (AssertionError. beats " must be vector, list or number."))))
         longest-v-in-args (--longest-vector args)
-        beats (if (< (count beats) longest-v-in-args)
+        beats (if (< (count (filter #(and (number? %) (pos? %)) beats))
+                     longest-v-in-args)
                 (vec (take longest-v-in-args (cycle beats)))
                 beats)]
     (swap! pattern-registry assoc k-name
            [(fn [] (create-event-queue (link/get-beat) beats))
-            inst
+            (if (and (= :inf envelope-type) (not pat-exists))
+              (apply inst (--resolve-arg-indicies (rest (rest args)) 0))
+              inst)
             (rest (rest args))])
     (when-not pat-exists
       (event-loop (fn [] (get @pattern-registry k-name))))))
 
-(defn pattern-control [i-name inst]
+(defn pattern-control [i-name envelope-type orig-arglists inst]
   (fn [& args]
     (if (empty? args)
       (inst)
@@ -194,22 +235,42 @@
               [nil nil]
               (let [ctl (name (first args))
                     pat-num (or (re-find #"[0-9]" ctl) 0)
-                    ctl-k (keyword (first (string/split ctl #"[0-9]")))]
-                [ctl-k pat-num]))]
+                    ctl-k (keyword (first (string/split ctl #"-")))]
+                [ctl-k pat-num]))
+            args (if (= :inf envelope-type)
+                   (loop [args args
+                          orig orig-arglists
+                          out-args []]
+                     (if (or (empty? args)
+                             ;; ignore tangling keyword
+                             (and (= 1 (count args)) (keyword? (first args))))
+                       out-args
+                       (if (keyword? (first args))
+                         (recur (rest (rest args))
+                                (rest orig)
+                                (conj out-args (first args) (second args)))
+                         (recur (rest args)
+                                (rest orig)
+                                (conj out-args (first orig) (first args))))))
+                   args)]
+        ;; (prn "ORIG: " orig-arglists)
         (case pat-ctl
-          :loop (--loop (str i-name "-" pat-num) inst args)
+          :loop (--loop (str i-name "-" pat-num)
+                        envelope-type inst args)
           :stop (pkill (str i-name "-" pat-num))
           :kill (pkill (str i-name "-" pat-num))
-          (apply inst args))))))
+          (apply inst (rest (rest args))))
+        pat-ctl))))
 
 (defmacro definst+
-  {:arglists '([name doc-string? params ugen-form])}
-  [i-name & inst-form]
+  {:arglists '([name envelope-type params ugen-form])}
+  [i-name envelope-type & inst-form]
   (let [[i-name params ugen-form] (synth-form i-name inst-form)
         i-name-str (name i-name)
+        orig-arglists (:arglists (meta i-name))
         i-name-new-meta (assoc (meta i-name)
                                :arglists (list 'quote
-                                               (list (->> (:arglists (meta i-name))
+                                               (list (->> orig-arglists
                                                           second first
                                                           (map #(symbol (name %)))
                                                           (cons 'beats)
@@ -218,17 +279,19 @@
         i-name (with-meta i-name (merge i-name-new-meta {:type ::instrument}))]
     `(let [inst# (inst ~i-name ~params ~ugen-form)]
        (def ~i-name
-         (pattern-control ~i-name-str inst#)))))
+         (pattern-control ~i-name-str ~envelope-type (mapv keyword (first ~orig-arglists)) inst#)))))
+
+
 
 ;; (prn (meta #'ding3))
 (comment 
-  (definst+ ding3
+  (definst+ ding3 :perc
     [note 60 amp 1 gate 1]
     (let [freq (midicps note)
           snd  (sin-osc freq)
           env  (env-gen (lin 0.01 0.1 0.6 0.3) gate :action FREE)]
       (* amp env snd)))
-
+  (ding3 nil nil 80)
   (ding3 :loop
          [0.25 0.25 0.5]
          [60   62   64]))
