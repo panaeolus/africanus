@@ -226,6 +226,32 @@
     (when-not pat-exists
       (event-loop (fn [] (get @pattern-registry k-name))))))
 
+(defn --fill-missing-keys-for-ctl
+  "Function that makes sure that calling inst
+   and calling ctl is possible with exact same
+   parameters produceing same result."
+  [args orig-arglists]
+  (letfn [(advance-to-arg [arg orig]
+            (let [idx (.indexOf orig arg)]
+              (if (> 0 idx)
+                orig
+                (into [] (subvec orig (inc idx))))))]
+    (loop [args args
+           orig orig-arglists
+           out-args []]
+      (if (or (empty? args)
+              ;; ignore tangling keyword
+              (and (= 1 (count args)) (keyword? (first args))))
+        out-args
+        (if (keyword? (first args))
+          (recur (rest (rest args))
+                 ;; (rest orig)
+                 (advance-to-arg (first args) orig)
+                 (conj out-args (first args) (second args)))
+          (recur (rest args)
+                 (vec (rest orig))
+                 (conj out-args (first orig) (first args))))))))
+
 (defn pattern-control [i-name envelope-type orig-arglists inst]
   (fn [& args]
     (if (empty? args)
@@ -238,20 +264,7 @@
                     ctl-k (keyword (first (string/split ctl #"-")))]
                 [ctl-k pat-num]))
             args (if (= :inf envelope-type)
-                   (loop [args args
-                          orig orig-arglists
-                          out-args []]
-                     (if (or (empty? args)
-                             ;; ignore tangling keyword
-                             (and (= 1 (count args)) (keyword? (first args))))
-                       out-args
-                       (if (keyword? (first args))
-                         (recur (rest (rest args))
-                                (rest orig)
-                                (conj out-args (first args) (second args)))
-                         (recur (rest args)
-                                (rest orig)
-                                (conj out-args (first orig) (first args))))))
+                   (--fill-missing-keys-for-ctl args orig-arglists)
                    args)]
         ;; (prn "ORIG: " orig-arglists)
         (case pat-ctl
