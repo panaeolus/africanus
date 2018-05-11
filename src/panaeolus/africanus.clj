@@ -5,6 +5,7 @@
             [clojure.core.async :refer [<! >! timeout go go-loop chan put!]]
             [clojure.string :as string]))
 
+
 (link/enable-link true)
 
 #_(defn calculate-timestamp
@@ -153,17 +154,22 @@
 (def pattern-registry (atom {}))
 
 (defn pkill [k-name]
-  (if (= :all k-name)
-    (do (when-let [keyz (keys @pattern-registry)]
-          (run! #(let [v (get @pattern-registry %)]
-                   (when (a-seq? v)
-                     (run! node-free (filter node? v))))
-                keyz))
-        (reset! pattern-registry {}))
-    (do (let [v (get @pattern-registry k-name)]
-          (when (a-seq? v)
-            (run! node-free (filter node? v))))
-        (swap! pattern-registry dissoc k-name))))
+  (letfn [(safe-node-kill [node]
+            (future
+              (try ;;(node-free node)
+                (kill node)
+                (catch Exception e nil))))]
+    (if (= :all k-name)
+      (do (when-let [keyz (keys @pattern-registry)]
+            (run! #(let [v (get @pattern-registry %)]
+                     (when (a-seq? v)
+                       (run! safe-node-kill (filter node? v))))
+                  keyz))
+          (reset! pattern-registry {}))
+      (do (let [v (get @pattern-registry k-name)]
+            (when (a-seq? v)
+              (run! safe-node-kill (filter node? v))))
+          (swap! pattern-registry dissoc k-name)))))
 
 ;; Useful util functions
 (defn samples-to-buffer [dir]
