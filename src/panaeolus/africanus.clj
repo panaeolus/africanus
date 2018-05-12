@@ -24,10 +24,10 @@
 
 (defn calc-mod-div
   [durations]
-  (let [meter 0
-        bar-length meter
+  (let [meter       0
+        bar-length  meter
         summed-durs (apply + (map #(Math/abs %) durations))]
-    (if (< 0 meter)
+    (if (pos? meter)
       (* bar-length
          (inc (quot (dec summed-durs) bar-length)))
       summed-durs)))
@@ -75,9 +75,8 @@
               (conj init (val a-index))
               (if-not (a-seq? val)
                 (conj init val)
-                (do
-                  ;; (prn (nth val (mod a-index (count val))) val a-index)
-                  (conj init (nth val (mod a-index (count val))))))))
+                ;; (prn (nth val (mod a-index (count val))) val a-index)
+                (conj init (nth val (mod a-index (count val)))))))
           []
           args))
 
@@ -94,7 +93,7 @@
                     (conj i (nth v n)))
                   (conj i v))) [] args))))
 
-(defn event-loop [get-event-queue]
+(defn event-loop [get-event-queue envelope-type]
   (let [[event-queue-fn inst args] (get-event-queue)]
     (go-loop [queue (event-queue-fn)
               inst inst
@@ -109,14 +108,16 @@
                        (let [multiargs-processed
                              (expand-nested-vectors-to-multiarg args-processed)]
                          (fn []
-                           (if (node? inst)
-                             nil
+                           (when (instrument? inst)
                              (run! #(apply inst %) multiargs-processed))
                            (put! wait-chn true)))
                        (fn []
-                         (if (node? inst)
-                           (apply ctl inst args-processed)
-                           (apply inst args-processed))
+                         (if (instrument? inst)
+                           (apply inst args-processed)
+                           (apply ctl inst
+                                  (if (= :gated envelope-type)
+                                    (into args-processed [:gate 1])
+                                    args-processed)))
                          (put! wait-chn true)))))
           (<! wait-chn)
           (recur (rest queue)
@@ -202,8 +203,7 @@
 
 
 (defn --longest-vector [args]
-  (let [seqs (->> (rest (rest args))
-                  (filter a-seq?))]
+  (let [seqs (filter a-seq? (rest (rest args)))]
     (if (empty? seqs)
       1
       (->> seqs
@@ -211,18 +211,18 @@
            (apply max)))))
 
 (defn --loop [k-name envelope-type inst args]
-  (let [pat-exists (contains? @pattern-registry k-name)
-        beats (second args)
-        beats (if (number? beats)
-                [beats]
-                (if (a-seq? beats)
-                  beats
-                  (throw (AssertionError. beats " must be vector, list or number."))))
+  (let [pat-exists        (contains? @pattern-registry k-name)
+        beats             (second args)
+        beats             (if (number? beats)
+                            [beats]
+                            (if (a-seq? beats)
+                              beats
+                              (throw (AssertionError. beats " must be vector, list or number."))))
         longest-v-in-args (--longest-vector args)
-        beats (if (< (count (filter #(and (number? %) (pos? %)) beats))
-                     longest-v-in-args)
-                (vec (take longest-v-in-args (cycle beats)))
-                beats)]
+        beats             (if (< (count (filter #(and (number? %) (pos? %)) beats))
+                                 longest-v-in-args)
+                            (vec (take longest-v-in-args (cycle beats)))
+                            beats)]
     (swap! pattern-registry assoc k-name
            [(fn [] (create-event-queue (link/get-beat) beats))
             (if (and (= :inf envelope-type) (not pat-exists))
@@ -230,7 +230,7 @@
               inst)
             (rest (rest args))])
     (when-not pat-exists
-      (event-loop (fn [] (get @pattern-registry k-name))))))
+      (event-loop (fn [] (get @pattern-registry k-name)) envelope-type))))
 
 (defn --fill-missing-keys-for-ctl
   "Function that makes sure that calling inst
@@ -239,11 +239,11 @@
   [args orig-arglists]
   (letfn [(advance-to-arg [arg orig]
             (let [idx (.indexOf orig arg)]
-              (if (> 0 idx)
+              (if (neg? idx)
                 orig
-                (into [] (subvec orig (inc idx))))))]
-    (loop [args args
-           orig orig-arglists
+                (vec (subvec orig (inc idx))))))]
+    (loop [args     args
+           orig     orig-arglists
            out-args []]
       (if (or (empty? args)
               ;; ignore tangling keyword
@@ -265,12 +265,13 @@
       (let [[pat-ctl pat-num]
             (if-not (keyword? (first args))
               [nil nil]
-              (let [ctl (name (first args))
+              (let [ctl     (name (first args))
                     pat-num (or (re-find #"[0-9]" ctl) 0)
-                    ctl-k (keyword (first (string/split ctl #"-")))]
+                    ctl-k   (keyword (first (string/split ctl #"-")))]
                 [ctl-k pat-num]))
-            args (if (= :inf envelope-type)
-                   (--fill-missing-keys-for-ctl args orig-arglists)
+            args (case envelope-type
+                   :inf   (--fill-missing-keys-for-ctl args orig-arglists)
+                   :gated (--fill-missing-keys-for-ctl args orig-arglists)
                    args)]
         ;; (prn "ORIG: " orig-arglists)
         (case pat-ctl
@@ -284,9 +285,10 @@
 (defmacro definst+
   {:arglists '([name envelope-type params ugen-form])}
   [i-name envelope-type & inst-form]
-  (let [[i-name params ugen-form] (synth-form i-name inst-form)
-        i-name-str (name i-name)
-        orig-arglists (:arglists (meta i-name))
+  (let [[i-name params ugen-form]
+        (synth-form i-name inst-form)
+        i-name-str      (name i-name)
+        orig-arglists   (:arglists (meta i-name))
         i-name-new-meta (assoc (meta i-name)
                                :arglists (list 'quote
                                                (list (->> orig-arglists
@@ -295,14 +297,12 @@
                                                           (cons 'beats)
                                                           (cons 'pat-ctl)
                                                           (into [])))))
-        i-name (with-meta i-name (merge i-name-new-meta {:type ::instrument}))]
+        i-name          (with-meta i-name (merge i-name-new-meta {:type ::instrument}))]
     `(let [inst# (inst ~i-name ~params ~ugen-form)]
        (def ~i-name
          (pattern-control ~i-name-str ~envelope-type (mapv keyword (first ~orig-arglists)) inst#)))))
 
 
-
-;; (prn (meta #'ding3))
 (comment 
   (definst+ ding3 :perc
     [note 60 amp 1 gate 1]
