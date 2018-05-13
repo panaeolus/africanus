@@ -101,17 +101,17 @@
               index 0 a-index 0]
       (if-let [next-timestamp (first queue)] 
         (let [wait-chn (chan)]
-          ;; (prn "next-timestamp" next-timestamp queue)
           (link/at next-timestamp
-                   (let [args-processed (--resolve-arg-indicies args index)]
+                   (let [args-processed (--resolve-arg-indicies args index)] 
                      (if (some a-seq? args-processed)
                        (let [multiargs-processed
                              (expand-nested-vectors-to-multiarg args-processed)]
+                         ;; (prn multiargs-processed)
                          (fn []
                            (when (instrument? inst)
                              (run! #(apply inst %) multiargs-processed))
                            (put! wait-chn true)))
-                       (fn []
+                       (fn [] 
                          (if (instrument? inst)
                            (apply inst args-processed)
                            (apply ctl inst
@@ -157,7 +157,8 @@
 (defn pkill [k-name]
   (letfn [(safe-node-kill [node]
             (future
-              (try ;;(node-free node)
+              (try
+                (node-free* node)
                 (kill node)
                 (catch Exception e nil))))]
     (if (= :all k-name)
@@ -260,27 +261,25 @@
 
 (defn pattern-control [i-name envelope-type orig-arglists inst]
   (fn [& args]
-    (if (empty? args)
-      (inst)
-      (let [[pat-ctl pat-num]
-            (if-not (keyword? (first args))
-              [nil nil]
-              (let [ctl     (name (first args))
-                    pat-num (or (re-find #"[0-9]" ctl) 0)
-                    ctl-k   (keyword (first (string/split ctl #"-")))]
-                [ctl-k pat-num]))
-            args (case envelope-type
-                   :inf   (--fill-missing-keys-for-ctl args orig-arglists)
-                   :gated (--fill-missing-keys-for-ctl args orig-arglists)
-                   args)]
-        ;; (prn "ORIG: " orig-arglists)
-        (case pat-ctl
-          :loop (--loop (str i-name "-" pat-num)
-                        envelope-type inst args)
-          :stop (pkill (str i-name "-" pat-num))
-          :kill (pkill (str i-name "-" pat-num))
-          (apply inst (rest (rest args))))
-        pat-ctl))))
+    (let [[pat-ctl pat-num]
+          (if-not (keyword? (first args))
+            [nil nil]
+            (let [ctl     (name (first args))
+                  pat-num (or (re-find #"[0-9]" ctl) 0)
+                  ctl-k   (keyword (first (string/split ctl #"-")))]
+              [ctl-k pat-num]))
+          args (case envelope-type
+                 :inf   (--fill-missing-keys-for-ctl args orig-arglists)
+                 :gated (--fill-missing-keys-for-ctl args orig-arglists)
+                 args)]
+      ;; (prn "ORIG: " orig-arglists)
+      (case pat-ctl
+        :loop (--loop (str i-name "-" pat-num)
+                      envelope-type inst args)
+        :stop (pkill (str i-name "-" pat-num))
+        :kill (pkill (str i-name "-" pat-num))
+        (apply inst (rest (rest args))))
+      pat-ctl)))
 
 (defmacro definst+
   {:arglists '([name envelope-type params ugen-form])}
