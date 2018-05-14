@@ -1,18 +1,20 @@
 (ns panaeolus.africanus
   (:use [overtone.live])
   (:require [overtone.ableton-link :as link]
+            [clojure.data :refer [diff]]
             [overtone.helpers.old-contrib :refer [name-with-attributes]]
-            [clojure.core.async :refer [<! >! timeout go go-loop chan put!]]
+            [clojure.core.async :refer [<! >! timeout go go-loop chan put! poll!] :as async]
             [clojure.string :as string]))
-
 
 (link/enable-link true)
 
+(link/set-bpm 160)
+
 #_(defn calculate-timestamp
     [last-tick mod-div beat] 
-    (let [last-tick (Math/ceil last-tick)
+    (let [last-tick    (Math/ceil last-tick)
           current-beat (max (mod last-tick mod-div) 0)
-          delta (- beat current-beat)]
+          delta        (- beat current-beat)]
       (if (neg? delta)
         (+ beat last-tick (- mod-div current-beat))
         (+ last-tick delta))))
@@ -20,31 +22,35 @@
 (defn a-seq? [v]
   (or (vector? v)
       (list? v)
-      (instance? clojure.lang.LazySeq v)))
+      (instance? clojure.lang.LazySeq v)
+      (instance? clojure.lang.Repeat v)))
+
+(defn synth-node? [v]
+  (= overtone.sc.node.SynthNode (type v)))
+
+(defn fractional-abs [num]
+  (if (pos? num) num (* -1 num)))
 
 (defn calc-mod-div
   [durations]
   (let [meter       0
         bar-length  meter
-        summed-durs (apply + (map #(Math/abs %) durations))]
+        summed-durs (apply + (map fractional-abs durations))] 
     (if (pos? meter)
       (* bar-length
          (inc (quot (dec summed-durs) bar-length)))
       summed-durs)))
 
-;; (create-event-queue 2 [0.25 0.25 0.25])
-
 (defn create-event-queue
   [last-tick beats]
-  (let [mod-div (calc-mod-div beats)
+  (let [mod-div   (calc-mod-div beats)
         ;; CHANGEME, make configureable
         last-tick (Math/ceil last-tick)]
-    ;; (prn last-tick beats)
-    (loop [beats (remove zero? beats)
+    (loop [beats     (remove zero? beats)
            ;; msg event-callbacks
-           silence 0
+           silence   0
            last-beat 0
-           at []]
+           at        []]
       (if (empty? beats)
         at
         ;; (mapv #(calculate-timestamp last-tick mod-div %) at)
@@ -56,7 +62,7 @@
                        (rest event-callbacks)
                        (rest msg)))
                  (if (neg? fbeat)
-                   (+ silence (Math/abs fbeat))
+                   (+ silence (fractional-abs fbeat))
                    0)
                  (if (neg? fbeat)
                    last-beat
@@ -69,10 +75,10 @@
                                  last-tick (last at)))))))))))
 
 
-(defn --resolve-arg-indicies [args a-index]
+(defn --resolve-arg-indicies [args index a-index]
   (reduce (fn [init val]
             (if (fn? val)
-              (conj init (val a-index))
+              (conj init (val index a-index))
               (if-not (a-seq? val)
                 (conj init val)
                 ;; (prn (nth val (mod a-index (count val))) val a-index)
@@ -94,63 +100,61 @@
                   (conj i v))) [] args))))
 
 (defn event-loop [get-event-queue envelope-type]
-  (let [[event-queue-fn inst args] (get-event-queue)]
+  (let [[event-queue-fn inst args fx] (get-event-queue)]
     (go-loop [queue (event-queue-fn)
               inst inst
               args args
-              index 0 a-index 0]
+              fx fx
+              index 0
+              a-index 0]
+      ;; (prn "fx" fx)
       (if-let [next-timestamp (first queue)] 
         (let [wait-chn (chan)]
           (link/at next-timestamp
-                   (let [args-processed (--resolve-arg-indicies args index)] 
+                   (let [args-processed (--resolve-arg-indicies args index a-index)
+                         fx-ctl-cb      (fn [] (when-not (empty? fx)
+                                                 (run! #(apply ctl (do (prn "LAST" (last %)) (last %))
+                                                               (--resolve-arg-indicies
+                                                                (second %) index a-index))
+                                                       (vals fx))))]
                      (if (some a-seq? args-processed)
                        (let [multiargs-processed
                              (expand-nested-vectors-to-multiarg args-processed)]
-                         ;; (prn multiargs-processed)
                          (fn []
+                           (go (fx-ctl-cb))
                            (when (instrument? inst)
                              (run! #(apply inst %) multiargs-processed))
                            (put! wait-chn true)))
-                       (fn [] 
+                       (fn []
+                         (prn "pre-shoot")
+                         (go (fx-ctl-cb))
+                         (prn "post-shoot")
                          (if (instrument? inst)
                            (apply inst args-processed)
                            (apply ctl inst
                                   (if (= :gated envelope-type)
                                     (into args-processed [:gate 1])
                                     args-processed)))
+                         (prn "post-inst")
                          (put! wait-chn true)))))
           (<! wait-chn)
           (recur (rest queue)
                  inst
                  args
+                 fx
                  (inc index)
                  (inc a-index)))
         (when-let [event-form (get-event-queue)]
-          (let [[event-queue-fn inst args] event-form]
+          (let [[event-queue-fn inst args new-fx] event-form]
+            ;; (when next-fx )
             (recur (event-queue-fn)
                    inst
                    args
+                   new-fx
                    0
                    a-index ;;(inc a-index)
                    )))))))
 
-#_(defn functionize-instr [instr]
-    (letfn [(resolve-vectors [lst]
-              (->> (reduce (fn [init v]
-                             (if (vector? v)
-                               (conj init (list nth v (list mod 'index `(count ~v)) `(first ~v)))
-                               (conj init v)))
-                           '()
-                           lst)
-                   reverse
-                   list
-                   (into '(doall))
-                   reverse
-                   ))]
-      (->> (map resolve-vectors (if (= 'do (first instr))
-                                  (rest instr)
-                                  (list instr)))
-           (concat '(fn [index])))))
 
 (def pattern-registry (atom {}))
 
@@ -163,14 +167,14 @@
                 (catch Exception e nil))))]
     (if (= :all k-name)
       (do (when-let [keyz (keys @pattern-registry)]
-            (run! #(let [v (get @pattern-registry %)]
-                     (when (a-seq? v)
-                       (run! safe-node-kill (filter node? v))))
+            (run! (fn [k] (let [v (get @pattern-registry k)]
+                            (when (a-seq? v)
+                              (run! safe-node-kill (filter synth-node? v)))))
                   keyz))
           (reset! pattern-registry {}))
       (do (let [v (get @pattern-registry k-name)]
             (when (a-seq? v)
-              (run! safe-node-kill (filter node? v))))
+              (run! safe-node-kill (filter synth-node? v))))
           (swap! pattern-registry dissoc k-name)))))
 
 ;; Useful util functions
@@ -181,26 +185,10 @@
                             (into [])
                             sort
                             (mapv load-sample))
-        array-buffer (buffer (count sample-buffers))]
+        array-buffer   (buffer (count sample-buffers))]
     (run! #(buffer-set! array-buffer % (:id (nth sample-buffers %)))
           (range (count sample-buffers)))
     array-buffer))
-
-#_(defn resolve-africanus-args [args]
-    (let [[args index] (if )]
-      (reduce
-       (fn [init val]
-         (conj ))
-       [] args)))
-
-#_(defmacro pat [k-name instr beats]
-    (let [instr (functionize-instr instr)]
-      `(let [instr# ~instr
-             pat-exists# (contains? @pattern-registry ~k-name)]
-         (swap! pattern-registry assoc ~k-name
-                (fn [] (create-event-queue (link/get-beat) ~beats [instr#])))
-         (when-not pat-exists#
-           (event-loop (fn [] (get @pattern-registry ~k-name)))))))
 
 
 (defn --longest-vector [args]
@@ -211,27 +199,93 @@
            (map count)
            (apply max)))))
 
+(defn --filter-fx [args]
+  (loop [args         args
+         fx-free-args []
+         fx           []]
+    (if (empty? args)
+      [fx-free-args (if (a-seq? fx) fx [fx])]
+      ;; QUICK FIX, REPAIR!
+      (if (and (= :fx (first args)) (< 1 (count args)))
+        (recur (rest (rest args))
+               fx-free-args
+               (second args))
+        (recur (rest args)
+               (conj fx-free-args (first args))
+               fx)))))
+
+
+(defn --replace-args-in-fx [old-fx new-fx]
+  (reduce (fn [init old-k]
+            (if (contains? new-fx old-k)
+              (assoc init old-k (assoc (get old-fx old-k) 1 (nth (get new-fx old-k) 1)))
+              init))
+          {}
+          (keys old-fx)))
+
 (defn --loop [k-name envelope-type inst args]
-  (let [pat-exists        (contains? @pattern-registry k-name)
-        beats             (second args)
-        beats             (if (number? beats)
-                            [beats]
-                            (if (a-seq? beats)
-                              beats
-                              (throw (AssertionError. beats " must be vector, list or number."))))
-        longest-v-in-args (--longest-vector args)
-        beats             (if (< (count (filter #(and (number? %) (pos? %)) beats))
-                                 longest-v-in-args)
-                            (vec (take longest-v-in-args (cycle beats)))
-                            beats)]
+  (let [pat-exists?              (contains? @pattern-registry k-name)
+        old-state                (get @pattern-registry k-name)
+        beats                    (second args)
+        beats                    (if (number? beats)
+                                   [beats]
+                                   (if (a-seq? beats)
+                                     beats
+                                     (throw (AssertionError. beats " must be vector, list or number."))))
+        [args fx-vector]         (--filter-fx args)
+        longest-v-in-args        (--longest-vector args)
+        beats                    (if (< (count (filter #(and (number? %) (pos? %)) beats))
+                                        longest-v-in-args)
+                                   (vec (take longest-v-in-args (cycle beats)))
+                                   beats)
+        ;; fx-handle-chan           (if pat-exists? (nth old-state 4) (chan (async/sliding-buffer 1)))
+        fx-handle-atom           (if pat-exists?
+                                   (nth old-state 4)
+                                   (atom nil)) 
+        new-fx                   (reduce (fn [i v] (assoc i (first v) (vec (rest v)))) {} fx-vector)
+        old-fx                   (if pat-exists? (--replace-args-in-fx (nth old-state 3) new-fx)
+                                     {})
+        [rem-fx next-fx curr-fx] (diff (set (keys old-fx)) (set (keys new-fx)))
+        fx-handle-callback       (when (or (not (empty? rem-fx)) (not (empty? next-fx)))
+                                   (fn []
+                                     (when-not (empty? rem-fx)
+                                       (let [old-fx-at-event (nth (get @pattern-registry k-name) 3)]
+                                         (run! #(when (node-active? (last %)) (node-free (last %)))
+                                               (vals (select-keys old-fx-at-event (vec rem-fx))))
+                                         (swap! pattern-registry assoc k-name
+                                                (assoc (get @pattern-registry k-name) 3
+                                                       (apply dissoc old-fx-at-event (vec rem-fx))))))
+                                     (when-not (empty? next-fx)
+                                       (swap! pattern-registry assoc k-name
+                                              (assoc (get @pattern-registry k-name) 3
+                                                     (reduce (fn [old next]
+                                                               (let [new-v   (get new-fx next)
+                                                                     fx-node (inst-fx! inst (first new-v))
+                                                                     indx0   (--resolve-arg-indicies (second new-v) 0 0)]
+                                                                 (apply ctl fx-node indx0)
+                                                                 (assoc old next (conj new-v fx-node))))
+                                                             old-fx next-fx))))))]
+    (reset! fx-handle-atom fx-handle-callback)
     (swap! pattern-registry assoc k-name
            [(fn [] (create-event-queue (link/get-beat) beats))
-            (if (and (= :inf envelope-type) (not pat-exists))
-              (apply inst (--resolve-arg-indicies (rest (rest args)) 0))
-              inst)
-            (rest (rest args))])
-    (when-not pat-exists
-      (event-loop (fn [] (get @pattern-registry k-name)) envelope-type))))
+            (if (and (= :inf envelope-type) (not pat-exists?))
+              (apply inst (--resolve-arg-indicies (rest (rest args)) 0 0))
+              (if (and pat-exists? (synth-node? (second old-state)))
+                (second old-state)
+                inst))
+            (rest (rest args))
+            old-fx
+            fx-handle-atom])
+    (when-not pat-exists?
+      (clear-fx inst)
+      (event-loop (fn []
+                    (let [cur-state (get @pattern-registry k-name)]
+                      (when cur-state
+                        (when-let [fx-handle-cb @(nth cur-state 4)]
+                          (fx-handle-cb)
+                          (reset! (nth cur-state 4) nil))))
+                    (get @pattern-registry k-name))
+                  envelope-type))))
 
 (defn --fill-missing-keys-for-ctl
   "Function that makes sure that calling inst
@@ -290,28 +344,84 @@
         orig-arglists   (:arglists (meta i-name))
         i-name-new-meta (assoc (meta i-name)
                                :arglists (list 'quote
-                                               (list (->> orig-arglists
-                                                          second first
-                                                          (map #(symbol (name %)))
-                                                          (cons 'beats)
-                                                          (cons 'pat-ctl)
-                                                          (into [])))))
-        i-name          (with-meta i-name (merge i-name-new-meta {:type ::instrument}))]
-    `(let [inst# (inst ~i-name ~params ~ugen-form)]
-       (def ~i-name
-         (pattern-control ~i-name-str ~envelope-type (mapv keyword (first ~orig-arglists)) inst#)))))
+                                               (list (conj (->> orig-arglists
+                                                                second first
+                                                                (map #(symbol (name %)))
+                                                                (cons 'beats)
+                                                                (cons 'pat-ctl) 
+                                                                (into []))
+                                                           'fx))))
+        i-name          (with-meta i-name (merge i-name-new-meta {:type ::instrument}))
+        inst            `(inst ~i-name ~params ~ugen-form)]
+    `(def ~(vary-meta i-name assoc :inst inst)
+       (pattern-control ~i-name-str ~envelope-type (mapv keyword (first ~orig-arglists)) ~inst))))
 
 
-(comment 
-  (definst+ ding3 :perc
+(defmacro adapt-fx
+  "Takes a normal fx from overtone and adapts it to africanus"
+  [original-fx new-name]
+  (let [original-fx-name  `(keyword (:name ~original-fx))
+        new-arglists      `(list (->> (:arglists (meta (var ~original-fx)))
+                                      first
+                                      (map #(symbol (name %)))
+                                      rest
+                                      vec))
+        new-name-and-meta (with-meta new-name
+                            {:arglists new-arglists
+                             :fx-name  original-fx-name})]
+    `(def ~new-name-and-meta
+       (fn [& args#]
+         [~original-fx-name ~original-fx
+          (--fill-missing-keys-for-ctl args# (mapv keyword (first ~new-arglists)))]))))
+
+
+(comment
+  (def chorus-fx (inst-fx! (:inst (meta #'ding20)) fx-chorus))
+  (demo (:inst (meta #'ding20)))
+  (chorus :depth 100)
+  (ctl chorus-fx :rate 1000 :depth 2)
+  (clear-fx (:inst (meta #'ding20)))
+  (chorus  100)
+  (node-free chorus-fx)
+  (adapt-fx fx-chorus chorus)
+  (adapt-fx fx-reverb reverb)
+  (adapt-fx fx-bitcrusher bitcrusher)
+  (adapt-fx fx-distortion-tubescreamer tubescreamer)
+  (adapt-fx fx-echo echo)
+  (adapt-fx fx-distortion distortion)
+  (ding20 nil nil 80 )
+
+  (definst+ ding20 :perc
     [note 60 amp 1 gate 1]
     (let [freq (midicps note)
           snd  (sin-osc freq)
-          env  (env-gen (lin 0.01 0.1 0.6 0.3) gate :action FREE)]
+          env  (env-gen (lin 0.01 0.1 0.2 0.3) gate :action FREE)]
       (* amp env snd)))
-  (ding3 nil nil 80)
-  (ding3 :loop
-         [0.25 0.25 0.5]
-         [60   62   64]))
 
-;; (type ding)
+  (definst ding1
+    [note 60 amp 1 gate 1]
+    (let [freq (midicps note)
+          snd  (sin-osc freq)
+          env  (env-gen (lin 0.01 0.1 0.4 0.3) gate :action FREE)]
+      (* amp env snd)))
+
+  (demo (ding1))
+  (tubescreamer )
+  (inst-fx! ding1 fx-echo)
+  (ctl tubescreamer 200 50 1000 2)
+
+  (ding20 :loop
+          [1 1 1]
+          [60   62   64]
+          0.8
+          :fx [(tubescreamer)]
+          )
+
+  (node-tree)
+  (ding20 :stop
+          [0.25 0.25 0.5]
+          [60   62   64])
+
+
+  ;; (type ding)
+  )

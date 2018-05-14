@@ -25,6 +25,6 @@
   
   ;; :native-path "native"
   
-  :source-paths ["src"]
+  :source-paths ["src" "dev"]
 
   )
