@@ -6,6 +6,7 @@
             [clojure.core.async :refer [<! >! timeout go go-loop chan put! poll!] :as async]
             [clojure.string :as string]))
 
+
 (link/enable-link true)
 
 (link/set-bpm 160)
@@ -113,7 +114,7 @@
           (link/at next-timestamp
                    (let [args-processed (--resolve-arg-indicies args index a-index)
                          fx-ctl-cb      (fn [] (when-not (empty? fx)
-                                                 (run! #(apply ctl (do (prn "LAST" (last %)) (last %))
+                                                 (run! #(apply ctl (last %)
                                                                (--resolve-arg-indicies
                                                                 (second %) index a-index))
                                                        (vals fx))))]
@@ -126,16 +127,16 @@
                              (run! #(apply inst %) multiargs-processed))
                            (put! wait-chn true)))
                        (fn []
-                         (prn "pre-shoot")
+                         ;; (prn "pre-shoot")
                          (go (fx-ctl-cb))
-                         (prn "post-shoot")
+                         ;; (prn "post-shoot")
                          (if (instrument? inst)
                            (apply inst args-processed)
                            (apply ctl inst
                                   (if (= :gated envelope-type)
                                     (into args-processed [:gate 1])
                                     args-processed)))
-                         (prn "post-inst")
+                         ;; (prn "post-inst")
                          (put! wait-chn true)))))
           (<! wait-chn)
           (recur (rest queue)
@@ -220,7 +221,7 @@
             (if (contains? new-fx old-k)
               (assoc init old-k (assoc (get old-fx old-k) 1 (nth (get new-fx old-k) 1)))
               init))
-          {}
+          old-fx
           (keys old-fx)))
 
 (defn --loop [k-name envelope-type inst args]
@@ -246,6 +247,7 @@
         old-fx                   (if pat-exists? (--replace-args-in-fx (nth old-state 3) new-fx)
                                      {})
         [rem-fx next-fx curr-fx] (diff (set (keys old-fx)) (set (keys new-fx)))
+        _                        (prn "rem-fx" rem-fx "next-fx" next-fx "curr-fx" curr-fx "old-fx" old-fx)
         fx-handle-callback       (when (or (not (empty? rem-fx)) (not (empty? next-fx)))
                                    (fn []
                                      (when-not (empty? rem-fx)
@@ -375,6 +377,13 @@
           (--fill-missing-keys-for-ctl args# (mapv keyword (first ~new-arglists)))]))))
 
 
+;; (defsynth fx-echo2
+;;   [bus 0 max-delay 1.0 delay-time 0.4 decay-time 2.0]
+;;   (let [source (in bus)
+;;         echo   (comb-n source max-delay delay-time decay-time)]
+;;     (out bus (pan2 (+ echo source) 0))))
+
+
 (comment
   (def chorus-fx (inst-fx! (:inst (meta #'ding20)) fx-chorus))
   (demo (:inst (meta #'ding20)))
@@ -390,7 +399,8 @@
   (adapt-fx fx-echo echo)
   (adapt-fx fx-distortion distortion)
   (ding20 nil nil 80 )
-
+  (stop)
+  
   (definst+ ding20 :perc
     [note 60 amp 1 gate 1]
     (let [freq (midicps note)
@@ -404,7 +414,7 @@
           snd  (sin-osc freq)
           env  (env-gen (lin 0.01 0.1 0.4 0.3) gate :action FREE)]
       (* amp env snd)))
-
+  (meta #'ding1 )
   (demo (ding1))
   (tubescreamer )
   (inst-fx! ding1 fx-echo)
@@ -414,7 +424,7 @@
           [1 1 1]
           [60   62   64]
           0.8
-          :fx [(tubescreamer)]
+          ;; :fx [(tubescreamer :gain 0)]
           )
 
   (node-tree)
