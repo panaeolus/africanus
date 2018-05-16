@@ -11,6 +11,8 @@
 
 (link/set-bpm 160)
 
+(def chan-hold (chan 1))
+
 #_(defn calculate-timestamp
     [last-tick mod-div beat] 
     (let [last-tick    (Math/ceil last-tick)
@@ -24,7 +26,9 @@
   (or (vector? v)
       (list? v)
       (instance? clojure.lang.LazySeq v)
-      (instance? clojure.lang.Repeat v)))
+      (instance? clojure.lang.Repeat v)
+      (instance? clojure.lang.Range v)
+      (instance? clojure.lang.LongRange v)))
 
 (defn synth-node? [v]
   (= overtone.sc.node.SynthNode (type v)))
@@ -42,9 +46,11 @@
          (inc (quot (dec summed-durs) bar-length)))
       summed-durs)))
 
+
 (defn create-event-queue
   [last-tick beats]
-  (let [mod-div   (calc-mod-div beats)
+  (let [beats     (if (fn? beats) (beats) beats)
+        mod-div   (calc-mod-div beats)
         ;; CHANGEME, make configureable
         last-tick (Math/ceil last-tick)]
     (loop [beats     (remove zero? beats)
@@ -53,7 +59,7 @@
            last-beat 0
            at        []]
       (if (empty? beats)
-        at
+        [at (+ last-tick mod-div)]
         ;; (mapv #(calculate-timestamp last-tick mod-div %) at)
         (let [fbeat (first beats)]
           (recur (rest beats)
@@ -100,9 +106,9 @@
                     (conj i (nth v n)))
                   (conj i v))) [] args))))
 
-(defn event-loop [get-event-queue envelope-type]
-  (let [[event-queue-fn inst args fx] (get-event-queue)]
-    (go-loop [queue (event-queue-fn)
+(defn event-loop [get-current-state envelope-type]
+  (let [[event-queue-fn inst args fx] (get-current-state)]
+    (go-loop [[queue mod-div] (event-queue-fn)
               inst inst
               args args
               fx fx
@@ -139,22 +145,26 @@
                          ;; (prn "post-inst")
                          (put! wait-chn true)))))
           (<! wait-chn)
-          (recur (rest queue)
+          (recur [(rest queue) mod-div]
                  inst
                  args
                  fx
                  (inc index)
                  (inc a-index)))
-        (when-let [event-form (get-event-queue)]
-          (let [[event-queue-fn inst args new-fx] event-form]
-            ;; (when next-fx )
-            (recur (event-queue-fn)
-                   inst
-                   args
-                   new-fx
-                   0
-                   a-index ;;(inc a-index)
-                   )))))))
+        (let [;;wait-for-mod-div (chan)
+              ]
+          ;; (link/at mod-div #(put! wait-for-mod-div true))
+          ;; (<! wait-for-mod-div)
+          (when-let [event-form (get-current-state)]
+            (let [[event-queue-fn inst args new-fx] event-form]
+              ;; (when next-fx )
+              (recur (event-queue-fn mod-div)
+                     inst
+                     args
+                     new-fx
+                     0
+                     a-index ;;(inc a-index)
+                     ))))))))
 
 
 (def pattern-registry (atom {}))
@@ -192,13 +202,13 @@
     array-buffer))
 
 
-(defn --longest-vector [args]
-  (let [seqs (filter a-seq? (rest (rest args)))]
-    (if (empty? seqs)
-      1
-      (->> seqs
-           (map count)
-           (apply max)))))
+#_(defn --longest-vector [args]
+    (let [seqs (filter a-seq? (rest (rest args)))]
+      (if (empty? seqs)
+        1
+        (->> seqs
+             (map count)
+             (apply max)))))
 
 (defn --filter-fx [args]
   (loop [args         args
@@ -225,21 +235,23 @@
           (keys old-fx)))
 
 (defn --loop [k-name envelope-type inst args]
-  (let [pat-exists?              (contains? @pattern-registry k-name)
-        old-state                (get @pattern-registry k-name)
-        beats                    (second args)
-        beats                    (if (number? beats)
-                                   [beats]
-                                   (if (a-seq? beats)
-                                     beats
-                                     (throw (AssertionError. beats " must be vector, list or number."))))
-        [args fx-vector]         (--filter-fx args)
-        longest-v-in-args        (--longest-vector args)
-        beats                    (if (< (count (filter #(and (number? %) (pos? %)) beats))
-                                        longest-v-in-args)
-                                   (vec (take longest-v-in-args (cycle beats)))
-                                   beats)
-        ;; fx-handle-chan           (if pat-exists? (nth old-state 4) (chan (async/sliding-buffer 1)))
+  (let [pat-exists?      (contains? @pattern-registry k-name)
+        old-state        (get @pattern-registry k-name)
+        beats            (second args)
+        beats            (if (number? beats)
+                           [beats]
+                           (if (a-seq? beats)
+                             beats
+                             (if (fn? beats)
+                               beats                        
+                               (throw (AssertionError. beats " must be vector, list or number.")))))
+        [args fx-vector] (--filter-fx args)
+        ;; longest-v-in-args        (--longest-vector args)
+        ;; beats                    (if (< (count (filter #(and (number? %) (pos? %)) beats))
+        ;;                                 longest-v-in-args)
+        ;;                            (vec (take longest-v-in-args (cycle beats)))
+        ;;                            beats)
+
         fx-handle-atom           (if pat-exists?
                                    (nth old-state 4)
                                    (atom nil)) 
@@ -247,12 +259,19 @@
         old-fx                   (if pat-exists? (--replace-args-in-fx (nth old-state 3) new-fx)
                                      {})
         [rem-fx next-fx curr-fx] (diff (set (keys old-fx)) (set (keys new-fx)))
-        _                        (prn "rem-fx" rem-fx "next-fx" next-fx "curr-fx" curr-fx "old-fx" old-fx)
+        ;; _                        (prn "rem-fx" rem-fx "next-fx" next-fx "curr-fx" curr-fx "old-fx" old-fx)
         fx-handle-callback       (when (or (not (empty? rem-fx)) (not (empty? next-fx)))
                                    (fn []
                                      (when-not (empty? rem-fx)
+                                       ;; (prn "NOT EMPTY!")
                                        (let [old-fx-at-event (nth (get @pattern-registry k-name) 3)]
-                                         (run! #(when (node-active? (last %)) (node-free (last %)))
+                                         ;; (prn "FOUND FROM OLD: " (keys old-fx-at-event))
+                                         (run! #(let [fx-node (last %)
+                                                      stereo? (vector? fx-node)]
+                                                  (if stereo?
+                                                    (when (node-active? (first fx-node))
+                                                      (run! (fn [n] (node-free n)) fx-node))
+                                                    (when (node-active? (last %)) (node-free (last %)))))
                                                (vals (select-keys old-fx-at-event (vec rem-fx))))
                                          (swap! pattern-registry assoc k-name
                                                 (assoc (get @pattern-registry k-name) 3
@@ -269,7 +288,7 @@
                                                              old-fx next-fx))))))]
     (reset! fx-handle-atom fx-handle-callback)
     (swap! pattern-registry assoc k-name
-           [(fn [] (create-event-queue (link/get-beat) beats))
+           [(fn [& [last-beat]] (create-event-queue (or last-beat (link/get-beat)) beats))
             (if (and (= :inf envelope-type) (not pat-exists?))
               (apply inst (--resolve-arg-indicies (rest (rest args)) 0 0))
               (if (and pat-exists? (synth-node? (second old-state)))
@@ -392,12 +411,7 @@
   (clear-fx (:inst (meta #'ding20)))
   (chorus  100)
   (node-free chorus-fx)
-  (adapt-fx fx-chorus chorus)
-  (adapt-fx fx-reverb reverb)
-  (adapt-fx fx-bitcrusher bitcrusher)
-  (adapt-fx fx-distortion-tubescreamer tubescreamer)
-  (adapt-fx fx-echo echo)
-  (adapt-fx fx-distortion distortion)
+
   (ding20 nil nil 80 )
   (stop)
   
@@ -414,14 +428,21 @@
           snd  (sin-osc freq)
           env  (env-gen (lin 0.01 0.1 0.4 0.3) gate :action FREE)]
       (* amp env snd)))
+
+  (def chorus-fx (inst-fx! ding1 fx-chorus))
+
+  (node-active? chorus-fx)
+  
   (meta #'ding1 )
   (demo (ding1))
   (tubescreamer )
   (inst-fx! ding1 fx-echo)
   (ctl tubescreamer 200 50 1000 2)
-
+  (demo (sin-osc))
+  
   (ding20 :loop
-          [1 1 1]
+          ;; (fn [] [1 1 1 1])
+          [0.25 0.25 0.25 0.25 -1 0.25 0.25 0.25 0.25 -1 -4]
           [60   62   64]
           0.8
           ;; :fx [(tubescreamer :gain 0)]
@@ -431,7 +452,6 @@
   (ding20 :stop
           [0.25 0.25 0.5]
           [60   62   64])
-
 
   ;; (type ding)
   )
