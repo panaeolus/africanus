@@ -285,7 +285,14 @@
                                                                      indx0   (--resolve-arg-indicies (second new-v) 0 0)]
                                                                  (apply ctl fx-node indx0)
                                                                  (assoc old next (conj new-v fx-node))))
-                                                             old-fx next-fx))))))]
+                                                             old-fx next-fx))))))
+        get-cur-state-fn         (fn []
+                                   (let [cur-state (get @pattern-registry k-name)]
+                                     (when cur-state
+                                       (when-let [fx-handle-cb @(nth cur-state 4)]
+                                         (fx-handle-cb)
+                                         (reset! (nth cur-state 4) nil))))
+                                   (get @pattern-registry k-name))]
     (reset! fx-handle-atom fx-handle-callback)
     (swap! pattern-registry assoc k-name
            [(fn [& [last-beat]] (create-event-queue (or last-beat (link/get-beat)) beats))
@@ -296,17 +303,12 @@
                 inst))
             (rest (rest args))
             old-fx
-            fx-handle-atom])
+            fx-handle-atom
+            ;; Restart-fn if someone solo'd
+            (fn [] (event-loop get-cur-state-fn envelope-type))])
     (when-not pat-exists?
       (clear-fx inst)
-      (event-loop (fn []
-                    (let [cur-state (get @pattern-registry k-name)]
-                      (when cur-state
-                        (when-let [fx-handle-cb @(nth cur-state 4)]
-                          (fx-handle-cb)
-                          (reset! (nth cur-state 4) nil))))
-                    (get @pattern-registry k-name))
-                  envelope-type))))
+      (event-loop get-cur-state-fn envelope-type))))
 
 (defn --fill-missing-keys-for-ctl
   "Function that makes sure that calling inst
@@ -334,6 +336,27 @@
                  (vec (rest orig))
                  (conj out-args (first orig) (first args))))))))
 
+(def --dozed-patterns
+  "When 1 pattern is solo,
+  restart functions from the
+  other patterns are kept here."
+  (atom {}))
+
+(defn unsolo []
+  (when-not (empty? @--dozed-patterns)
+    (swap! pattern-registry merge @--dozed-patterns)
+    (run! (fn [v] ((nth v 5))) (vals @--dozed-patterns))
+    (reset! --dozed-patterns {})))
+
+(defn solo [pat-name & [duration]]
+  (let [dozed-state (dissoc @pattern-registry pat-name)]
+    (reset! --dozed-patterns dozed-state)
+    (reset! pattern-registry  {pat-name (get @pattern-registry pat-name)})
+    (when (and (number? duration) (< 0 duration))
+      (link/at (+ (Math/ceil (link/get-beat)) duration)
+               #(unsolo)))))
+
+
 (defn pattern-control [i-name envelope-type orig-arglists inst]
   (fn [& args]
     (let [[pat-ctl pat-num]
@@ -349,44 +372,25 @@
                  args)]
       ;; (prn "ORIG: " orig-arglists)
       (case pat-ctl
-        :loop (--loop (str i-name "-" pat-num)
-                      envelope-type inst args)
+        :loop (do (unsolo)
+                  (--loop (str i-name "-" pat-num)
+                          envelope-type inst args))
         :stop (pkill (str i-name "-" pat-num))
+        :solo (solo (str i-name "-" 0) (read-string pat-num))
         :kill (pkill (str i-name "-" pat-num))
         (apply inst (rest (rest args))))
       pat-ctl)))
 
-(defmacro definst+
-  {:arglists '([name envelope-type params ugen-form])}
-  [i-name envelope-type & inst-form]
-  (let [[i-name params ugen-form]
-        (synth-form i-name inst-form)
-        i-name-str      (name i-name)
-        orig-arglists   (:arglists (meta i-name))
-        i-name-new-meta (assoc (meta i-name)
-                               :arglists (list 'quote
-                                               (list (conj (->> orig-arglists
-                                                                second first
-                                                                (map #(symbol (name %)))
-                                                                (cons 'beats)
-                                                                (cons 'pat-ctl) 
-                                                                (into []))
-                                                           'fx))))
-        i-name          (with-meta i-name (merge i-name-new-meta {:type ::instrument}))
-        inst            `(inst ~i-name ~params ~ugen-form)]
-    `(def ~(vary-meta i-name assoc :inst inst)
-       (pattern-control ~i-name-str ~envelope-type (mapv keyword (first ~orig-arglists)) ~inst))))
-
-
 (defmacro adapt-fx
   "Takes a normal fx from overtone and adapts it to africanus"
-  [original-fx new-name]
+  [original-fx new-name default-args]
   (let [original-fx-name  `(keyword (:name ~original-fx))
         new-arglists      `(list (->> (:arglists (meta (var ~original-fx)))
                                       first
                                       (map #(symbol (name %)))
                                       rest
-                                      vec))
+                                      vec)
+                                 (or ~default-args []))
         new-name-and-meta (with-meta new-name
                             {:arglists new-arglists
                              :fx-name  original-fx-name})]
@@ -394,6 +398,33 @@
        (fn [& args#]
          [~original-fx-name ~original-fx
           (--fill-missing-keys-for-ctl args# (mapv keyword (first ~new-arglists)))]))))
+
+(defmacro definst+
+  {:arglists '([name envelope-type params ugen-form])}
+  [i-name envelope-type & inst-form]
+  (let [[i-name params ugen-form]
+        (synth-form i-name inst-form)
+        i-name-str          (name i-name)
+        orig-arglists       (:arglists (meta i-name))
+        arglists-w-defaults (reduce (fn [i v] (if (symbol? v)
+                                                (conj i (keyword v))
+                                                (conj i v))) [] (first inst-form))
+        _                   (prn arglists-w-defaults)
+        i-name-new-meta     (assoc (meta i-name)
+                                   :arglists (list 'quote
+                                                   (list (conj (->> orig-arglists
+                                                                    second first
+                                                                    (map #(symbol (name %)))
+                                                                    (cons 'beats)
+                                                                    (cons 'pat-ctl) 
+                                                                    (into []))
+                                                               'fx)
+                                                         arglists-w-defaults)))
+        i-name              (with-meta i-name (merge i-name-new-meta {:type ::instrument}))
+        inst                `(inst ~i-name ~params ~ugen-form)]
+    `(def ~(vary-meta i-name assoc :inst inst)
+       (pattern-control ~i-name-str ~envelope-type (mapv keyword (first ~orig-arglists)) ~inst))))
+
 
 
 ;; (defsynth fx-echo2
