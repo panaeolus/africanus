@@ -285,7 +285,7 @@
                                                                      indx0   (--resolve-arg-indicies (second new-v) 0 0)]
                                                                  (apply ctl fx-node indx0)
                                                                  (assoc old next (conj new-v fx-node))))
-                                                             old-fx next-fx))))))
+                                                             (nth (get @pattern-registry k-name) 3) next-fx))))))
         get-cur-state-fn         (fn []
                                    (let [cur-state (get @pattern-registry k-name)]
                                      (when cur-state
@@ -363,7 +363,7 @@
           (if-not (keyword? (first args))
             [nil nil]
             (let [ctl     (name (first args))
-                  pat-num (or (re-find #"[0-9]" ctl) 0)
+                  pat-num (or (re-find #"[0-9]+" ctl) 0)
                   ctl-k   (keyword (first (string/split ctl #"-")))]
               [ctl-k pat-num]))
           args (case envelope-type
@@ -376,7 +376,7 @@
                   (--loop (str i-name "-" pat-num)
                           envelope-type inst args))
         :stop (pkill (str i-name "-" pat-num))
-        :solo (solo (str i-name "-" 0) (read-string pat-num))
+        :solo (solo (str i-name "-" 0) (if (empty? pat-num) 0 (read-string pat-num)))
         :kill (pkill (str i-name "-" pat-num))
         (apply inst (rest (rest args))))
       pat-ctl)))
@@ -409,7 +409,6 @@
         arglists-w-defaults (reduce (fn [i v] (if (symbol? v)
                                                 (conj i (keyword v))
                                                 (conj i v))) [] (first inst-form))
-        _                   (prn arglists-w-defaults)
         i-name-new-meta     (assoc (meta i-name)
                                    :arglists (list 'quote
                                                    (list (conj (->> orig-arglists
