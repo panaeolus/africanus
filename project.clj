@@ -11,7 +11,10 @@
                  [overtone/overtone "0.11.0"]
                  [overtone/scsynth "3.9.3-1"]
                  [overtone/scsynth-extras "3.9.3-1"]
-                 [rm-hull/markov-chains "0.1.1"]]
+                 [rm-hull/markov-chains "0.1.1"]
+                 [com.github.wendykierp/JTransforms "3.1"]
+                 [cfft "0.1.0"]
+                 [net.mikera/core.matrix "0.62.0"]                 ]
 
   :jvm-opts ^:replace ["-Xms512m" "-Xmx1g"
                        "-XX:+UseParNewGC"

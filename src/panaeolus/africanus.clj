@@ -9,7 +9,7 @@
 
 (link/enable-link true)
 
-(link/set-bpm 160)
+(link/set-bpm 140)
 
 (def chan-hold (chan 1))
 
@@ -46,13 +46,13 @@
          (inc (quot (dec summed-durs) bar-length)))
       summed-durs)))
 
-
 (defn create-event-queue
   [last-tick beats]
-  (let [beats     (if (fn? beats) (beats) beats)
+  (let [last-tick (Math/ceil last-tick)
+        beats     (if (fn? beats) (beats {:last-tick last-tick}) beats)
         mod-div   (calc-mod-div beats)
         ;; CHANGEME, make configureable
-        last-tick (Math/ceil last-tick)]
+        ]
     (loop [beats     (remove zero? beats)
            ;; msg event-callbacks
            silence   0
@@ -82,10 +82,12 @@
                                  last-tick (last at)))))))))))
 
 
-(defn --resolve-arg-indicies [args index a-index]
+(defn --resolve-arg-indicies [args index a-index next-timestamp extra-atom]
   (reduce (fn [init val]
             (if (fn? val)
-              (conj init (val index a-index))
+              (conj init (val {:index      index          :a-index a-index
+                               :timestamp  next-timestamp :args    args
+                               :extra-atom extra-atom}))
               (if-not (a-seq? val)
                 (conj init val)
                 ;; (prn (nth val (mod a-index (count val))) val a-index)
@@ -106,7 +108,7 @@
                     (conj i (nth v n)))
                   (conj i v))) [] args))))
 
-(defn event-loop [get-current-state envelope-type]
+(defn event-loop [get-current-state envelope-type extra-atom]
   (let [[event-queue-fn inst args fx] (get-current-state)]
     (go-loop [[queue mod-div] (event-queue-fn)
               inst inst
@@ -118,11 +120,12 @@
       (if-let [next-timestamp (first queue)] 
         (let [wait-chn (chan)]
           (link/at next-timestamp
-                   (let [args-processed (--resolve-arg-indicies args index a-index)
+                   (let [args-processed (--resolve-arg-indicies args index a-index next-timestamp extra-atom)
                          fx-ctl-cb      (fn [] (when-not (empty? fx)
                                                  (run! #(apply ctl (last %)
                                                                (--resolve-arg-indicies
-                                                                (second %) index a-index))
+                                                                (second %) index a-index
+                                                                next-timestamp extra-atom))
                                                        (vals fx))))]
                      (if (some a-seq? args-processed)
                        (let [multiargs-processed
@@ -235,23 +238,23 @@
           (keys old-fx)))
 
 (defn --loop [k-name envelope-type inst args]
-  (let [pat-exists?      (contains? @pattern-registry k-name)
-        old-state        (get @pattern-registry k-name)
-        beats            (second args)
-        beats            (if (number? beats)
-                           [beats]
-                           (if (a-seq? beats)
-                             beats
-                             (if (fn? beats)
-                               beats                        
-                               (throw (AssertionError. beats " must be vector, list or number.")))))
-        [args fx-vector] (--filter-fx args)
+  (let [pat-exists?              (contains? @pattern-registry k-name)
+        old-state                (get @pattern-registry k-name)
+        beats                    (second args)
+        beats                    (if (number? beats)
+                                   [beats]
+                                   (if (a-seq? beats)
+                                     beats
+                                     (if (fn? beats)
+                                       beats                        
+                                       (throw (AssertionError. beats " must be vector, list or number.")))))
+        [args fx-vector]         (--filter-fx args)
         ;; longest-v-in-args        (--longest-vector args)
         ;; beats                    (if (< (count (filter #(and (number? %) (pos? %)) beats))
         ;;                                 longest-v-in-args)
         ;;                            (vec (take longest-v-in-args (cycle beats)))
         ;;                            beats)
-
+        extra-atom               (atom {})
         fx-handle-atom           (if pat-exists?
                                    (nth old-state 4)
                                    (atom nil)) 
@@ -282,7 +285,10 @@
                                                      (reduce (fn [old next]
                                                                (let [new-v   (get new-fx next)
                                                                      fx-node (inst-fx! inst (first new-v))
-                                                                     indx0   (--resolve-arg-indicies (second new-v) 0 0)]
+                                                                     indx0   (--resolve-arg-indicies
+                                                                              (second new-v)
+                                                                              0 0 (link/get-beat)
+                                                                              extra-atom)]
                                                                  (apply ctl fx-node indx0)
                                                                  (assoc old next (conj new-v fx-node))))
                                                              (nth (get @pattern-registry k-name) 3) next-fx))))))
@@ -297,7 +303,7 @@
     (swap! pattern-registry assoc k-name
            [(fn [& [last-beat]] (create-event-queue (or last-beat (link/get-beat)) beats))
             (if (and (= :inf envelope-type) (not pat-exists?))
-              (apply inst (--resolve-arg-indicies (rest (rest args)) 0 0))
+              (apply inst (--resolve-arg-indicies (rest (rest args)) 0 0 (link/get-beat) extra-atom))
               (if (and pat-exists? (synth-node? (second old-state)))
                 (second old-state)
                 inst))
@@ -305,10 +311,10 @@
             old-fx
             fx-handle-atom
             ;; Restart-fn if someone solo'd
-            (fn [] (event-loop get-cur-state-fn envelope-type))])
+            (fn [] (event-loop get-cur-state-fn envelope-type extra-atom))])
     (when-not pat-exists?
       (clear-fx inst)
-      (event-loop get-cur-state-fn envelope-type))))
+      (event-loop get-cur-state-fn envelope-type extra-atom))))
 
 (defn --fill-missing-keys-for-ctl
   "Function that makes sure that calling inst
